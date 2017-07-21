@@ -4,9 +4,11 @@ scrp.shell - shell parser/simulator
 
 import os.path
 from bashlex import parser, ast
+from argparse import ArgumentParser, Namespace, ArgumentError
 
 from error import ShellError
 
+# TODO: should this be CommandResult for consistency?
 class CmdResult(object):
     def __init__(self, retval, stdout='', stderr=''):
         self.retval = retval
@@ -14,6 +16,28 @@ class CmdResult(object):
         self.stderr = stderr
     def __str__(self):
         return "CmdResult(retval={}, stdout={!r}, stderr={!r})".format(self.retval, self.stdout, self.stderr)
+
+CommandNotFound = CmdResult(127) # TODO: stderr?
+
+class Command(object):
+    def __init__(self, shell):
+        self.shell = shell
+        self.parser = ArgumentParser()
+        self.init()
+
+    def init(self):
+        pass
+
+    def parse(self, argv):
+        # FIXME: handle ArgumentError cleanly
+        return self.parser.parse_known_args(argv)
+
+    def run(self, opts, args):
+        return CmdResult(0)
+
+    def __call__(self, argv):
+        opts, args = self.parse(argv)
+        return self.run(opts, args)
 
 class MockShell(ast.nodevisitor):
     default_env = {
@@ -39,14 +63,20 @@ class MockShell(ast.nodevisitor):
         for name, val in self.default_env.items():
             self.setenv(name, val)
 
+        self.ctx = Namespace()
+
     def setenv(self, name, val):
         self.env[name] = val
 
     def add_command(self, path, handler):
-        if callable(handler) or isinstance(handler, CmdResult):
+        if type(handler) == type(Command) and issubclass(handler, Command):
+            self.commands[path] = handler(self)
+        elif isinstance (handler, CmdResult):
+            self.commands[path] = lambda argv: handler
+        elif callable(handler):
             self.commands[path] = handler
         else:
-            raise ValueError("command handler should be a CmdResult or a callable that returns one")
+            raise ValueError("handler should be Command, CmdResult, or callable that returns CmdResult")
 
     def _find_cmd(self, cmd):
         if os.path.isabs(cmd):
@@ -61,20 +91,32 @@ class MockShell(ast.nodevisitor):
                 if ncmd:
                     return ncmd
 
-    def mock_run_command(self, node):
-        print("  cmd: {}".format(node.cmd))
-        ncmd = self._find_cmd(node.cmd[0])
-        print("    binary: {}".format(ncmd))
-        result = self.commands.get(ncmd, CmdResult(127))
-        if callable(result):
-            result = result(node.cmd)
-        self.lastval = result.retval
+    def _run_cmd(self, cmd, argv):
+        handler = self.commands.get(cmd, CommandNotFound)
+        if isinstance(handler, CmdResult):
+            return handler
+        elif callable(handler):
+            return handler(argv)
+        else:
+            raise ValueError("bad handler for {}: {}".format(cmd, handler))
+
+    # TODO: make debug output configurable
+    def mock_run_command(self, argv):
+        print("  argv: {}".format(argv))
+
+        cmd = self._find_cmd(argv[0])
+        print("    binary: {}".format(cmd))
+
+        result = self._run_cmd(cmd, argv)
         print("    result: {}".format(result))
+
+        self.lastval = result.retval
         return result
 
     def visitcommand(self, node, parts):
-        node.cmd = [n.word for n in parts if n.kind == 'word']
-        node.result = self.mock_run_command(node)
+        # FIXME: Is this correct when there's redirects etc?
+        node.argv = [n.word for n in parts if n.kind == 'word']
+        node.result = self.mock_run_command(node.argv)
 
     def visitlist(self, node, parts):
         print("start cmd list")
@@ -110,15 +152,3 @@ class MockShell(ast.nodevisitor):
             if dump:
                 print(tree.dump())
             self.visit(tree)
-
-class Command(object):
-    '''Represents a mock command'''
-    def __init__(self, path):
-        self.path = path
-
-class Groupadd(Command):
-    pass
-    # so this should have like:
-    # declare your parser (as a dict of dicts)
-    # a parse(argv) function that returns (opts)
-    # a run(self, opts) function that takes `opts` and returns CmdResult
